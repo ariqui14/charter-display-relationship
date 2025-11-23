@@ -31,3 +31,17 @@ export const updateDeliverables = mutation({
     });
   }
 });
+
+export const updatePosition = mutation({
+  args: {
+    id: v.id("teams"),
+    x: v.float64(),
+    y: v.float64(),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.patch(args.id, {
+      position_x: args.x,
+      position_y: args.y,
+    });
+  },
+});

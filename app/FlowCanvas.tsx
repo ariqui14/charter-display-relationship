@@ -8,6 +8,7 @@ import { api } from "../convex/_generated/api";
 import { getLayoutedElements } from "./layout/elkLayout";
 import { useMutation } from "convex/react";
 import SelfLoopEdge from "./SelfLoopEdge";
+import { Id } from "../convex/_generated/dataModel";
  
 import ReactFlow, {
   ReactFlowProvider,
@@ -18,7 +19,8 @@ import ReactFlow, {
   EdgeChange,
   Connection,
   Edge,
-  useReactFlow
+  useReactFlow,
+  MarkerType
 } from "reactflow";
 
 import "reactflow/dist/style.css";
@@ -39,15 +41,15 @@ const item = {
 };
 
 //Helper Function for visual relationship clarity
-function getStatusColor(status?: string) {
+function getStatusStyles(status?: string) {
   switch (status) {
     case "complete":
-      return "#16a34a"; // green
+      return { background: "#16a34a", color: "#ffffff" };
     case "in-progress":
-      return "#facc15"; // yellow
+      return { background: "#facc15", color: "#000000" };
     case "not-started":
     default:
-      return "#64748b"; // gray
+      return { background: "#64748b", color: "#ffffff" };
   }
 }
 
@@ -66,6 +68,7 @@ export default function FlowCanvas() {
 
  
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [isDragging, setIsDragging] = useState(false);
   const [selectedTeam, setSelectedTeam] = useState<any | null>(null);
   const [layoutApplied, setLayoutApplied] = useState(false); 
   const { fitView } = useReactFlow();
@@ -86,67 +89,163 @@ export default function FlowCanvas() {
   const updateDeliverables = useMutation(api.teams.updateDeliverables);
   const saveRelationships = useMutation(api.previous_saves.saveRelationships);
   const loadRelationships = useMutation(api.previous_saves.loadRelationships);
+  const updatePosition = useMutation(api.teams.updatePosition);
+
     //Queries
   const previousSaves = useQuery(api.previous_saves.getSavedTimestamps);
 
 
   // Build nodes and edges from DB
-    useEffect(() => {
-        if (!teams) return;
+  useEffect(() => {
+    if (!teams) return;
 
-  // ---------- NODES ----------
-    const rawNodes: TeamNode[] = teams.map((t) => ({
-        id: t.team,
-        position: { x: 0, y: 0 },
+    // Use Convex document `_id` as the ReactFlow node id so we can persist
+    // positions from the DB and update them without the graph snapping back.
+    const mappedNodes: TeamNode[] = teams.map((t) => {
+      const isNextPhase = t.team === "NEXT PHASE";
+      // Accept 'Testing' or 'TESTING' (case-insensitive) as the special node
+      const isTesting = (t.team || "").toString().toUpperCase() === "TESTING";
+      return {
+        id: t._id,
+        position: {
+          x: t.position_x ?? 0,
+          y: t.position_y ?? 0,
+        },
         data: { label: t.team, deliverables: t.deliverables },
         type: "default",
-        draggable: t.team !== "NEXT PHASE"   // 🔒 locked node
-    }));
+        // Lock both NEXT PHASE and TESTING so they cannot be dragged
+        draggable: !isNextPhase && !isTesting,
+        // Special visual styling for the NEXT PHASE and TESTING nodes
+        style: isNextPhase || isTesting
+          ? {
+              border: "3px solid #3b82f6",
+              borderRadius: 12,
+              padding: 12,
+              width: 360,
+              height: 180,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontWeight: 700,
+              fontSize: 36,
+              background: "#e0f2fe", // light blue background
+            }
+          : undefined,
+      };
+    });
 
-    const positionedNodes = layoutNodesInGrid(rawNodes);
+    // Ensure the NEXT PHASE node is placed below all other nodes and
+    // the TESTING node is centered among all other nodes.
+    const otherNodes = mappedNodes.filter(
+      (n) => {
+        const label = (n.data?.label || "").toString().toUpperCase();
+        return label !== "NEXT PHASE" && label !== "TESTING";
+      }
+    );
 
-  // ---------- EDGES ----------
+    if (otherNodes.length > 0) {
+      const maxY = otherNodes.reduce((m, n) => Math.max(m, n.position.y ?? 0), 0);
+      const meanX = Math.round(
+        otherNodes.reduce((s, n) => s + (n.position.x ?? 0), 0) / otherNodes.length
+      );
+
+      // compute bounding box to place TESTING in the geometric center
+      const xs = otherNodes.map((n) => n.position.x ?? 0);
+      const ys = otherNodes.map((n) => n.position.y ?? 0);
+      const minX = Math.min(...xs);
+      const maxX = Math.max(...xs);
+      const minY = Math.min(...ys);
+      const maxYBox = Math.max(...ys);
+      const centerX = Math.round((minX + maxX) / 2) || meanX || 400;
+      const centerY = Math.round((minY + maxYBox) / 2) || Math.round(maxY / 2) || 300;
+
+      const newNodes = mappedNodes.map((n) => {
+        const label = (n.data?.label || "").toString().toUpperCase();
+
+        if (label === "NEXT PHASE") {
+          return {
+            ...n,
+            position: {
+              x: meanX || n.position.x || 0,
+              y: maxY + 220,
+            },
+          };
+        }
+
+        if (label === "TESTING") {
+          return {
+            ...n,
+            draggable: false,
+            position: {
+              x: centerX,
+              y: centerY,
+            },
+          };
+        }
+
+        return n;
+      });
+
+      // replace mappedNodes with positioned special nodes
+      // @ts-ignore - reassign for continued usage
+      mappedNodes.length = 0;
+      newNodes.forEach((n) => mappedNodes.push(n));
+    }
+
+    // Build edges using node ids (team _id). The deliverables store the
+    // human-readable `deliver_to` team name, so resolve that to the target _id.
     const edgeMap = new Map<string, Edge>();
 
     teams.forEach((team) => {
-        team.deliverables?.forEach((deliverable: any) => {
+      team.deliverables?.forEach((deliverable: any) => {
         if (!deliverable.deliver_to) return;
 
-        const edgeId = `${team.team}->${deliverable.deliver_to}`;
+        // Resolve source/target ids
+        const sourceId = team._id;
+        const targetTeam = teams.find((tt) => tt.team === deliverable.deliver_to);
+        if (!targetTeam) return; // skip edges where we can't resolve the target team name
+        const targetId = targetTeam._id;
+
+        const edgeId = `${sourceId}->${targetId}`;
 
         if (!edgeMap.has(edgeId)) {
-            const status = deliverable.status;
-            const isSelfLoop = team.team === deliverable.deliver_to;
+          const status = deliverable.status;
+          const isSelfLoop = sourceId === targetId;
 
-            edgeMap.set(edgeId, {
-                id: edgeId,
-                source: team.team,
-                target: deliverable.deliver_to,
-                type: isSelfLoop ? "self" : "smoothstep",
-                animated: status === "in-progress",
-                style: {
-                    stroke: getStatusColor(status),
-                    strokeWidth: 3
-                },
-                markerEnd: {
-                type: "arrowclosed",
-                width: 20,
-                height: 20,
-                color: getStatusColor(status)
-                },
-                data: {
-                    status,
-                    text: deliverable.text
-                }
-            });
+          edgeMap.set(edgeId, {
+            id: edgeId,
+            source: sourceId,
+            target: targetId,
+            type: isSelfLoop ? "self" : "smoothstep",
+            animated: status === "in-progress",
+            style: {
+              stroke: getStatusStyles(status).background,
+              strokeWidth: 3,
+            },
+            markerEnd: {
+              type: MarkerType.ArrowClosed,
+              width: 20,
+              height: 20,
+              color: getStatusStyles(status).background,
+            },
+            data: {
+              status,
+              text: deliverable.text,
+            },
+          });
         }
-        });
+      });
     });
 
-    setNodes(positionedNodes);
+    setNodes(mappedNodes);
     setEdges(Array.from(edgeMap.values()));
-    setLayoutApplied(true);
-}, [teams]);
+    // If any team already has saved positions in the DB, don't run the layout
+    // pass that would override them. Only run layout when no positions exist.
+    const hasSavedPositions = teams.some(
+      (t) => typeof t.position_x === "number" && typeof t.position_y === "number"
+    );
+    setLayoutApplied(hasSavedPositions);
+  }, [teams]);
 
     const edgeTypes = { //For self referential Loops
         self: SelfLoopEdge
@@ -158,34 +257,39 @@ function isEdgeConnected(edge: Edge, nodeId: string | null) {
   return edge.source === nodeId || edge.target === nodeId;
 }
 
+// Helper to resolve a team name from its Convex document _id.
+function getTeamName(id: string | undefined | null) {
+  if (!id) return "";
+  return teams?.find((t) => t._id === id)?.team ?? id;
+}
+
 useEffect(() => {
   if (!selectedNodeId) return;
+  if (isDragging) return; // don't run radial spread while user is actively dragging
 
     //---- Edge Styling and Label Updates
   setEdges((eds) =>
-    eds.map((edge) => {
+  eds.map((edge) => {
         const isConnected = isEdgeConnected(edge, selectedNodeId);
-        const statusColor = getStatusColor(edge.data?.status);
+        const statusColor = getStatusStyles(edge.data?.status).background;
+        const isInProgress = edge.data?.status === "in-progress";
         return {
             ...edge,
-            animated: isConnected,
+            // Keep edges with status 'in-progress' animated regardless of selection
+            animated: isInProgress || isConnected,
             style: {
-                stroke: isConnected ? '#38bdf8' : statusColor,
-                strokeWidth: isConnected ? 5 : 3,
+                stroke: statusColor,
+                strokeWidth: isConnected ? 8 : 3,
                 opacity: isConnected ? 1 : 0.7
             },
             label: isConnected
-                ? `${edge.source} → ${edge.target} (${getDeliverableLabel(edge)})`
-                : undefined,
-            labelStyle: {
-                fill: '#38bdf8',
-                fontWeight: 600
-            }
+              ? `${getTeamName(edge.source)} → ${getTeamName(edge.target)} (${getDeliverableLabel(edge)})`
+              : undefined,
     };
     })
   );
-  // ----- Update Sidebar Team
-  setSelectedTeam(teams?.find(t => t.team === selectedNodeId));
+  // ----- Update Sidebar Team (selectedNodeId is a team _id)
+  setSelectedTeam(teams?.find(t => t._id === selectedNodeId));
 
 // ----- Radial Spread of Connected Nodes
 setNodes((nds)=> {
@@ -202,7 +306,7 @@ setNodes((nds)=> {
     const centerNode = nds.find(n=> n.id === selectedNodeId);
     if (!centerNode) return nds;
 
-    const radius = 300;
+    const radius = 450;
     let angle = 0;
     const step = (2 * Math.PI) / connectedNodeIds.size;
 
@@ -227,7 +331,7 @@ setNodes((nds)=> {
 )
 
 
-}, [selectedNodeId, teams]);
+}, [selectedNodeId, teams, isDragging]);
 
 useEffect(() => {
   if (selectedTeam) {
@@ -240,11 +344,17 @@ useEffect(() => {
 function getDeliverableLabel(edge: Edge) {
   if (!teams || !selectedNodeId) return null;
 
-  const team = teams.find(t => t.team === selectedNodeId);
+  // selectedNodeId is a team _id. Find the team and then search its deliverables.
+  const team = teams.find((t) => t._id === selectedNodeId);
   if (!team || !team.deliverables) return null;
 
-  const deliverable = team.deliverables.find(
-    (d: any) => d.deliver_to === edge.target
+  // deliverable.deliver_to in the DB is a human-readable team name. Edge.target
+  // is the target _id. Match either by target id or by resolving the target
+  // team's name.
+  const targetTeamName = teams.find((t) => t._id === edge.target)?.team;
+
+  const deliverable = team.deliverables.find((d: any) =>
+    d.deliver_to === edge.target || d.deliver_to === targetTeamName
   );
 
   return deliverable?.text || `TEAM EXPECTING DELIVERABLE`;
@@ -320,6 +430,7 @@ return [...laidOutGrid, ...laidOutBottom];
 //Call Layout function to fit nodes horizontally
 
   useEffect(() => {
+    if (isDragging) return; // avoid layouting while user is dragging
     if (!nodes.length || !edges.length || layoutApplied) return;
 
     const applyLayout = async () => {
@@ -338,7 +449,7 @@ return [...laidOutGrid, ...laidOutBottom];
     };
 
     applyLayout();
-  }, [nodes, edges, layoutApplied]);
+  }, [nodes, edges, layoutApplied, isDragging]);
 
 
   // Handlers
@@ -347,6 +458,63 @@ return [...laidOutGrid, ...laidOutBottom];
       setNodes((ns) => applyNodeChanges(changes as any, ns as any) as TeamNode[]),
     []
   );
+
+  const onNodeDragStop = useCallback((_: any, node: TeamNode) => {
+    // Node ids are Convex team _ids. Optimistically update local node position
+    // so the UI doesn't snap back while the backend updates.
+
+    // Find NEXT PHASE node to ensure we don't allow dropping at/under it.
+    const nextPhase = nodes.find((n) => n.data?.label === "NEXT PHASE");
+    let clampedY = node.position.y;
+    const minY = nextPhase ? (nextPhase.position.y - 150) : -Infinity;
+    if (clampedY >= minY) {
+      clampedY = minY;
+    }
+
+    const newPos = { x: node.position.x, y: clampedY };
+
+    setNodes((ns) =>
+      ns.map((n) => (n.id === node.id ? { ...n, position: newPos } : n))
+    );
+
+    // Prevent nodes from being dragged into the TESTING node area.
+    const testingNode = nodes.find((n) => (n.data?.label || "").toString().toUpperCase() === "TESTING");
+    if (testingNode && testingNode.id !== node.id) {
+      const dx = newPos.x - (testingNode.position.x ?? 0);
+      const dy = newPos.y - (testingNode.position.y ?? 0);
+      const dist = Math.hypot(dx, dy);
+      const minDist = 220; // minimum separation from TESTING
+
+      if (dist < minDist) {
+        if (dist === 0) {
+          newPos.x = (testingNode.position.x ?? 0) + minDist;
+          newPos.y = testingNode.position.y ?? 0;
+        } else {
+          const nx = dx / dist;
+          const ny = dy / dist;
+          newPos.x = (testingNode.position.x ?? 0) + nx * minDist;
+          newPos.y = (testingNode.position.y ?? 0) + ny * minDist;
+        }
+
+        // apply the adjusted position locally
+        setNodes((ns) =>
+          ns.map((n) => (n.id === node.id ? { ...n, position: newPos } : n))
+        );
+      }
+    }
+
+    updatePosition({
+      id: node.id as Id<"teams">,
+      x: newPos.x,
+      y: newPos.y,
+    });
+
+    // clear dragging flag after stopping
+    setIsDragging(false);
+
+    console.log(`NODE POSITIONED. id: ${node.id} x: ${newPos.x}, y: ${newPos.y}`);
+  }, [updatePosition, nodes]);
+
 
   const onEdgesChange = useCallback(
     (changes: EdgeChange[]) =>
@@ -359,6 +527,10 @@ return [...laidOutGrid, ...laidOutBottom];
       setEdges((es) => addEdge(params, es)),
     []
   );
+
+  const onNodeDragStart = useCallback((_: any, node: TeamNode) => {
+    setIsDragging(true);
+  }, []);
 
   return (
     <div className="flex h-screen w-screen bg-zinc-100 dark:bg-black overflow-hidden">
@@ -483,7 +655,21 @@ return [...laidOutGrid, ...laidOutBottom];
               <option value="blocked">blocked</option>
             </select>
           ) : (
-            <p className="text-xs text-zinc-400">Status: {d.status}</p>
+            <p className="text-xs">
+              <span
+                style={{
+                  background: getStatusStyles(d.status).background,
+                  color: getStatusStyles(d.status).color,
+                  padding: "4px 8px",
+                  borderRadius: 8,
+                  fontWeight: 700,
+                  textTransform: "capitalize",
+                  display: "inline-block",
+                }}
+              >
+                {d.status}
+              </span>
+            </p>
           )}
 
         </div>
@@ -561,7 +747,9 @@ return [...laidOutGrid, ...laidOutBottom];
             fitView
             className="bg-white dark:bg-zinc-800"
             onNodeClick={onNodeClick}      
-            nodesConnectable = {false}     
+            nodesConnectable = {false}     //Relationships only editable from side panel, not drawn from Node to Node
+            onNodeDragStart={onNodeDragStart}
+            onNodeDragStop={onNodeDragStop}
 
           />
         </ReactFlowProvider>
