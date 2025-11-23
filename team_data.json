@@ -1,0 +1,38 @@
+[
+  {
+    "team": "Navigation",
+    "deliverables": [
+      { "text": "Design nav architecture", "status": "complete" },
+      { "text": "Kalman filter prototype", "status": "in-progress" },
+      { "text": "Sensor fusion test", "status": "not-started" }
+    ]
+  },
+  {
+    "team": "Communications",
+    "deliverables": [
+      { "text": "Antenna link budget", "status": "complete" },
+      { "text": "Ground station testing", "status": "in-progress" }
+    ]
+  },
+  {
+    "team": "Propulsion",
+    "deliverables": [
+      { "text": "Thruster layout", "status": "in-progress" },
+      { "text": "Hot-fire test plan", "status": "not-started" }
+    ]
+  },
+  {
+    "team": "Power",
+    "deliverables": [
+      { "text": "EPS architecture", "status": "complete" },
+      { "text": "Solar panel deployment test", "status": "in-progress" }
+    ]
+  },
+  {
+    "team": "Thermal",
+    "deliverables": [
+      { "text": "Thermal model v1", "status": "not-started" },
+      { "text": "Heatsink optimization", "status": "not-started" }
+    ]
+  }
+]
