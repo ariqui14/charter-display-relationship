@@ -1,6 +1,6 @@
 //This and teams.ts can be collapsed more cleanly into a single schema.ts file
 import { mutation, query } from "./_generated/server";
-import { asObjectValidator, v } from "convex/values";
+import { v } from "convex/values";
 
 export const saveRelationships = mutation({
   handler: async (ctx) => {
